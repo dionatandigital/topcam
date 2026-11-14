@@ -257,10 +257,11 @@ enum ProOverlays {
     }
 
     /// Listras sobre as áreas com luz estourada.
-    static func zebra(_ image: CIImage) -> CIImage {
+    /// `level` de 0.75 a 1.0 (75% a 100%, como no Blackmagic).
+    static func zebra(_ image: CIImage, level: Float = 0.95) -> CIImage {
         let t = CIFilter.colorThreshold()
         t.inputImage = luminanceMask(image)
-        t.threshold = 0.95
+        t.threshold = powf(min(max(level, 0.5), 1), 2.2)
         guard let mask = t.outputImage else { return image }
         let stripes = CIFilter.stripesGenerator()
         stripes.color0 = CIColor(red: 1, green: 1, blue: 1, alpha: 0.9)
@@ -277,7 +278,7 @@ enum ProOverlays {
     }
 
     /// Contorno verde nas partes que estão em foco.
-    static func focusPeaking(_ image: CIImage) -> CIImage {
+    static func focusPeaking(_ image: CIImage, color: CIColor = CIColor(red: 0.22, green: 1, blue: 0.42)) -> CIImage {
         let edges = CIFilter.edges()
         edges.inputImage = luminanceMask(image)
         edges.intensity = 6
@@ -286,12 +287,17 @@ enum ProOverlays {
         t.inputImage = luminanceMask(e)
         t.threshold = 0.35
         guard let mask = t.outputImage else { return image }
-        let green = CIImage(color: CIColor(red: 0.22, green: 1, blue: 0.42)).cropped(to: image.extent)
+        let green = CIImage(color: color).cropped(to: image.extent)
         let blend = CIFilter.blendWithMask()
         blend.inputImage = green
         blend.backgroundImage = image
         blend.maskImage = mask
         return blend.outputImage?.cropped(to: image.extent) ?? image
+    }
+
+    /// Falsa cor: rosa = pele clara ok, verde = cinza médio/pele escura, vermelho = estourado.
+    static func falseColor(_ image: CIImage) -> CIImage {
+        ColorCube.apply(image, name: "falsecolor", transform: CubeLooks.falseColor)
     }
 }
 

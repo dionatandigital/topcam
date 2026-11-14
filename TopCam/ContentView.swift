@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import AVKit
+import UniformTypeIdentifiers
 
 extension Color {
     static let topAccent = Color(red: 1.0, green: 0.643, blue: 0.106)
@@ -57,6 +58,15 @@ struct ContentView: View {
                                 .stroke(Color.topAccent, lineWidth: 1.5)
                                 .frame(width: 84, height: 84)
                                 .position(fp)
+                                .allowsHitTesting(false)
+                        }
+                    }
+                    .overlay {
+                        if camera.mode != .video, camera.frameAspect != .off || camera.showSafeArea {
+                            let f = camera.renderer.frameInView
+                            FrameGuideOverlay(ratio: camera.frameAspect.ratio, safeArea: camera.showSafeArea)
+                                .frame(width: geo.size.width * f.width, height: geo.size.height * f.height)
+                                .position(x: geo.size.width * f.midX, y: geo.size.height * f.midY)
                                 .allowsHitTesting(false)
                         }
                     }
@@ -260,6 +270,13 @@ struct ContentView: View {
                     .padding(.horizontal, 10).frame(height: 26)
                     .background(Capsule().fill(Color.topAccent))
             }
+            if camera.blurOn, camera.mode != .video {
+                Text("FUNDO f/\(apertureText(camera.blurAperture))")
+                    .font(.system(size: 12, weight: .bold))
+                    .padding(.horizontal, 10).frame(height: 26)
+                    .background(Capsule().fill(Color.black.opacity(0.55)))
+                    .overlay(Capsule().stroke(Color.topAccent, lineWidth: 1))
+            }
             if camera.autoScene, camera.mode != .pro, !camera.detectedScene.isEmpty {
                 HStack(spacing: 8) {
                     Image(systemName: "sparkles").foregroundStyle(Color.topAccent)
@@ -323,8 +340,15 @@ struct ContentView: View {
             if camera.mode == .pro {
                 ProControls(camera: camera)
             } else {
+                if camera.mode == .photo { blurRow }
                 intensityRow
                 looksRow
+                Text(camera.look.subtitle)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color.topSecondary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
             }
 
             if camera.mode == .video {
@@ -355,6 +379,25 @@ struct ContentView: View {
                 .font(.system(size: 13, weight: .semibold).monospacedDigit())
                 .foregroundStyle(Color.topAccent)
                 .frame(width: 42, alignment: .trailing)
+        }
+    }
+
+    /// Desfocar o fundo: deixa a pessoa, o casal ou o objeto nítido.
+    private var blurRow: some View {
+        HStack(spacing: 12) {
+            ToggleChip(title: camera.blurOn ? "Fundo ✓" : "Desfocar fundo", isOn: $camera.blurOn)
+            if camera.blurOn {
+                Slider(value: Binding(get: { 17.4 - camera.blurAperture },
+                                      set: { camera.blurAperture = ((17.4 - $0) * 10).rounded() / 10 }),
+                       in: 1.4...16)
+                    .tint(Color.topAccent)
+                Text("f/\(apertureText(camera.blurAperture))")
+                    .font(.system(size: 13, weight: .semibold).monospacedDigit())
+                    .foregroundStyle(Color.topAccent)
+                    .frame(width: 46, alignment: .trailing)
+            } else {
+                Spacer()
+            }
         }
     }
 
@@ -430,6 +473,10 @@ struct ContentView: View {
 
     // MARK: - Formatação
 
+    private func apertureText(_ f: Double) -> String {
+        f >= 10 ? String(format: "%.0f", f) : String(format: "%.1f", f)
+    }
+
     private func timeString(_ seconds: Int) -> String {
         String(format: "%02d:%02d", seconds / 60, seconds % 60)
     }
@@ -465,7 +512,7 @@ struct LooksPicker: View {
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 18) {
-                ForEach(Look.allCases) { look in
+                ForEach(Look.available) { look in
                     Button {
                         onSelect(look)
                     } label: {
@@ -501,6 +548,32 @@ struct ProControls: View {
                 }
                 ToggleChip(title: "Zebra", isOn: $camera.showZebra)
                 ToggleChip(title: "Foco", isOn: $camera.showPeaking)
+                ToggleChip(title: "Cor", isOn: $camera.showFalseColor)
+            }
+
+            if camera.proParam == .wb {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(0..<Self.wbPresets.count, id: \.self) { i in
+                            Button {
+                                camera.setWhiteBalancePreset(Self.wbPresets[i].1)
+                            } label: {
+                                Text("\(Self.wbPresets[i].0) \(Int(Self.wbPresets[i].1))K")
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .padding(.horizontal, 10).frame(height: 30)
+                                    .background(Capsule().fill(Color.white.opacity(0.1)))
+                            }
+                        }
+                    }
+                }
+            } else if camera.proParam == .focus {
+                HStack(spacing: 8) {
+                    rackButton(slot: 0, value: camera.focusA)
+                    rackButton(slot: 1, value: camera.focusB)
+                    Text("Segure para salvar · toque para ir")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Color.topSecondary)
+                }
             }
 
             HStack(spacing: 6) {
@@ -545,6 +618,22 @@ struct ProControls: View {
         }
     }
 
+    static let wbPresets: [(String, Float)] = [("Sol", 5500), ("Nublado", 6500), ("Sombra", 7500),
+                                               ("Incand.", 3200), ("Fluor.", 4000)]
+
+    private func rackButton(slot: Int, value: Float?) -> some View {
+        let name = slot == 0 ? "A" : "B"
+        return Text(value == nil ? "Foco \(name) +" : "Ir \(name)")
+            .font(.system(size: 12, weight: .bold))
+            .foregroundStyle(value == nil ? .white : Color(red: 0.1, green: 0.07, blue: 0.02))
+            .padding(.horizontal, 12).frame(height: 30)
+            .background(Capsule().fill(value == nil ? Color.white.opacity(0.1) : Color.topAccent))
+            .onTapGesture {
+                if let value { camera.rackFocus(to: value) } else { camera.saveFocusPoint(slot) }
+            }
+            .onLongPressGesture(minimumDuration: 0.5) { camera.saveFocusPoint(slot) }
+    }
+
     private func valueText(_ param: ProParam) -> String {
         let prefix = camera.isManual ? "" : "A "
         switch param {
@@ -556,6 +645,8 @@ struct ProControls: View {
             return prefix + "1/\(Int((1 / max(s, 0.0001)).rounded()))"
         case .wb:
             return camera.isManual ? "\(Int(camera.whiteBalance))K" : "AWB"
+        case .tint:
+            return camera.isManual ? String(format: "%+.0f", camera.tint) : "A"
         case .focus:
             return camera.isManual ? String(format: "%.2f", camera.focus) : "AF"
         case .ev:
@@ -567,7 +658,8 @@ struct ProControls: View {
         switch camera.proParam {
         case .iso: return Double(camera.isoRange.lowerBound)...Double(camera.isoRange.upperBound)
         case .shutter: return 0...1
-        case .wb: return 2500...9000
+        case .wb: return 2500...10000
+        case .tint: return -50...50
         case .focus: return 0...1
         case .ev: return Double(camera.biasRange.lowerBound)...Double(camera.biasRange.upperBound)
         }
@@ -584,6 +676,7 @@ struct ProControls: View {
                     let s = min(max(camera.shutterSeconds, lo), hi)
                     return log(s / lo) / log(hi / lo)
                 case .wb: return Double(camera.whiteBalance)
+                case .tint: return Double(camera.tint)
                 case .focus: return Double(camera.focus)
                 case .ev: return Double(camera.exposureBias)
                 }
@@ -641,7 +734,7 @@ struct ToggleChip: View {
     }
 }
 
-// MARK: - Revisão da última foto (antes/depois e trocar o look)
+// MARK: - Revisão da última foto (antes/depois, trocar o look e desfocar o fundo)
 
 struct ReviewView: View {
     @ObservedObject var camera: CameraModel
@@ -651,38 +744,75 @@ struct ReviewView: View {
     @State private var image: UIImage?
     @State private var original: UIImage?
     @State private var showOriginal = false
+    @State private var blurOn = false
+    @State private var aperture: Double = 2.8
+    @State private var focusBackground = false
+    @State private var masks: SubjectMasks?
+    @State private var selected: Set<Int> = []
+    @State private var analyzing = false
+    @State private var hint = ""
+
+    private var mask: CIImage? { masks?.combined(selected) }
+    private var blurOptions: BlurOptions? {
+        blurOn && mask != nil ? BlurOptions(aperture: aperture, focusOnBackground: focusBackground) : nil
+    }
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: 16) {
-                ZStack {
-                    Color.black
-                    if let shown = showOriginal ? original : image {
-                        Image(uiImage: shown).resizable().scaledToFit()
-                    } else {
-                        ProgressView()
-                    }
-                    VStack {
-                        HStack {
-                            Text(showOriginal ? "Antes" : "Depois")
-                                .font(.system(size: 12, weight: .semibold))
-                                .padding(.horizontal, 10).padding(.vertical, 4)
-                                .background(Capsule().fill(Color.black.opacity(0.6)))
+            VStack(spacing: 12) {
+                GeometryReader { geo in
+                    ZStack {
+                        Color.black
+                        if let shown = showOriginal ? original : image {
+                            Image(uiImage: shown).resizable().scaledToFit()
+                        } else {
+                            ProgressView()
+                        }
+                        VStack {
+                            HStack {
+                                Text(showOriginal ? "Antes" : "Depois")
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .padding(.horizontal, 10).padding(.vertical, 4)
+                                    .background(Capsule().fill(Color.black.opacity(0.6)))
+                                Spacer()
+                                Text("Segure: antes")
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .padding(.horizontal, 10).padding(.vertical, 6)
+                                    .background(Capsule().fill(Color.black.opacity(0.6)))
+                                    .gesture(
+                                        DragGesture(minimumDistance: 0)
+                                            .onChanged { _ in showOriginal = true }
+                                            .onEnded { _ in showOriginal = false }
+                                    )
+                            }
                             Spacer()
                         }
-                        Spacer()
+                        .padding(10)
                     }
-                    .padding(10)
+                    .contentShape(Rectangle())
+                    .gesture(SpatialTapGesture().onEnded { value in handleTap(value.location, size: geo.size) })
                 }
                 .clipShape(RoundedRectangle(cornerRadius: 16))
-                .gesture(
-                    DragGesture(minimumDistance: 0)
-                        .onChanged { _ in showOriginal = true }
-                        .onEnded { _ in showOriginal = false }
-                )
 
-                Text("Segure a foto para ver o antes")
+                Text(hint.isEmpty ? look.subtitle : hint)
                     .font(.footnote).foregroundStyle(Color.topSecondary)
+                    .lineLimit(2).multilineTextAlignment(.center)
+
+                HStack(spacing: 12) {
+                    ToggleChip(title: blurOn ? "Fundo ✓" : "Desfocar fundo", isOn: $blurOn)
+                    if blurOn {
+                        Slider(value: Binding(get: { 17.4 - aperture },
+                                              set: { aperture = ((17.4 - $0) * 10).rounded() / 10 }),
+                               in: 1.4...16, onEditingChanged: { editing in if !editing { refresh() } })
+                            .tint(Color.topAccent)
+                        Text(String(format: "f/%.1f", aperture))
+                            .font(.system(size: 13, weight: .semibold).monospacedDigit())
+                            .foregroundStyle(Color.topAccent)
+                            .frame(width: 48, alignment: .trailing)
+                    } else {
+                        Spacer()
+                    }
+                }
 
                 HStack(spacing: 12) {
                     Text("Intensidade").font(.system(size: 13, weight: .semibold))
@@ -698,11 +828,12 @@ struct ReviewView: View {
 
                 LooksPicker(selected: look) { newLook in
                     look = newLook
+                    hint = ""
                     refresh()
                 }
 
                 Button {
-                    camera.saveReviewVersion(look: look, intensity: intensity)
+                    camera.saveReviewVersion(look: look, intensity: intensity, blur: blurOptions, mask: blurOptions == nil ? nil : mask)
                     dismiss()
                 } label: {
                     Text("Salvar como nova foto")
@@ -723,18 +854,80 @@ struct ReviewView: View {
         }
         .preferredColorScheme(.dark)
         .tint(Color.topAccent)
+        .onChange(of: blurOn) { _, on in
+            if on { analyze() } else { hint = ""; refresh() }
+        }
         .onAppear {
             look = camera.look
             intensity = camera.intensity
+            aperture = camera.blurAperture
             original = camera.reviewPreview(look: .original, intensity: 0)
             refresh()
         }
     }
 
-    private func refresh() {
-        let l = look, i = intensity
+    /// Procura as pessoas (ou o assunto) uma vez; depois é só tocar para escolher.
+    private func analyze() {
+        if masks != nil { updateHint(); refresh(); return }
+        analyzing = true
+        hint = "Procurando pessoas e o assunto…"
         DispatchQueue.global(qos: .userInitiated).async {
-            let img = camera.reviewPreview(look: l, intensity: i)
+            let found = camera.reviewMasks()
+            DispatchQueue.main.async {
+                analyzing = false
+                masks = found
+                selected = Set(found?.instances ?? [])
+                updateHint()
+                refresh()
+            }
+        }
+    }
+
+    private func updateHint() {
+        guard let masks else {
+            hint = "Não achei um assunto nesta foto para separar do fundo."
+            return
+        }
+        if masks.peopleMode {
+            let n = masks.instances.count
+            hint = n > 1
+                ? "\(n) pessoas. Toque em alguém para tirar ou pôr no foco. Toque no fundo para focar lá."
+                : "Pessoa no foco. Toque no fundo para focar lá."
+        } else {
+            hint = "Assunto no foco. Toque no fundo para focar lá."
+        }
+    }
+
+    private func handleTap(_ location: CGPoint, size: CGSize) {
+        guard blurOn, let masks, let shown = image, shown.size.width > 0, shown.size.height > 0 else { return }
+        // Área que a foto ocupa dentro do quadro (encaixada).
+        let scale = min(size.width / shown.size.width, size.height / shown.size.height)
+        let w = shown.size.width * scale, h = shown.size.height * scale
+        let x0 = (size.width - w) / 2, y0 = (size.height - h) / 2
+        let p = CGPoint(x: (location.x - x0) / w, y: (location.y - y0) / h)
+        guard (0...1).contains(p.x), (0...1).contains(p.y) else { return }
+
+        if let id = masks.instance(at: p) {
+            if focusBackground {
+                focusBackground = false
+            } else if selected.contains(id) {
+                if selected.count > 1 { selected.remove(id) }
+            } else {
+                selected.insert(id)
+            }
+            hint = masks.peopleMode ? "\(selected.count) no foco. Toque para escolher quem fica nítido." : "Assunto no foco."
+        } else {
+            focusBackground.toggle()
+            hint = focusBackground ? "Foco no fundo: o assunto ficou desfocado. Toque nele para voltar." : "Foco no assunto."
+        }
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        refresh()
+    }
+
+    private func refresh() {
+        let l = look, i = intensity, b = blurOptions, m = mask
+        DispatchQueue.global(qos: .userInitiated).async {
+            let img = camera.reviewPreview(look: l, intensity: i, blur: b, mask: m)
             DispatchQueue.main.async { image = img }
         }
     }
@@ -745,6 +938,7 @@ struct ReviewView: View {
 struct SettingsView: View {
     @ObservedObject var camera: CameraModel
     @Environment(\.dismiss) private var dismiss
+    @State private var importLUT = false
 
     var body: some View {
         NavigationStack {
@@ -752,6 +946,29 @@ struct SettingsView: View {
                 Section("Tela") {
                     Toggle("Linhas de grade", isOn: $camera.showGrid)
                     Toggle("Look automático pela cena", isOn: $camera.autoScene)
+                }
+                Section {
+                    Picker("Enquadramento", selection: $camera.frameAspect) {
+                        ForEach(FrameAspect.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    Toggle("Salvar a foto já cortada", isOn: $camera.cropOnSave)
+                    Toggle("Área segura do Instagram", isOn: $camera.showSafeArea)
+                } header: {
+                    Text("Redes sociais")
+                } footer: {
+                    Text("4:5 é o tamanho do feed; 9:16 é Reels e Stories. A área segura mostra onde os botões do Instagram ficam por cima.")
+                }
+                Section {
+                    Toggle("Desfocar fundo nas fotos", isOn: $camera.blurOn)
+                    HStack {
+                        Text("Abertura")
+                        Slider(value: $camera.blurAperture, in: 1.4...16, step: 0.1)
+                        Text(String(format: "f/%.1f", camera.blurAperture)).monospacedDigit()
+                    }
+                } header: {
+                    Text("Fundo")
+                } footer: {
+                    Text("f/1.4 desfoca muito; f/16 quase nada. Depois da foto, toque na miniatura para escolher quem fica nítido.")
                 }
                 Section("Foto") {
                     Picker("Resolução", selection: $camera.photoMegapixels) {
@@ -776,24 +993,54 @@ struct SettingsView: View {
                                                                      set: { camera.setFrameRate($0) })) {
                         ForEach([24, 30, 60], id: \.self) { Text("\($0) fps").tag($0) }
                     }
-                    Text("Cabem cerca de \(camera.minutesLeft) minutos de vídeo nessa qualidade.")
+                    Toggle("Travar o branco ao gravar", isOn: $camera.lockWBOnRecord)
+                    Toggle("Obturador de cinema (sem piscar no LED)", isOn: $camera.cinemaShutter)
+                    Text("Cabem cerca de \(camera.minutesLeft) minutos de vídeo nessa qualidade. O obturador de cinema usa 1/60 (ou 1/120 em 60 fps): movimento natural e sem faixas na luz de 60 Hz.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
-                Section("Modo Pro") {
+                Section {
                     Toggle("Histograma", isOn: $camera.showHistogram)
                     Toggle("Zebra (luz estourada)", isOn: $camera.showZebra)
+                    HStack {
+                        Text("Nível da zebra")
+                        Slider(value: $camera.zebraLevel, in: 75...100, step: 5)
+                        Text("\(Int(camera.zebraLevel))%").monospacedDigit()
+                    }
                     Toggle("Realce de foco", isOn: $camera.showPeaking)
+                    Picker("Cor do realce", selection: $camera.peakColor) {
+                        ForEach(PeakColor.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    Toggle("Falsa cor", isOn: $camera.showFalseColor)
+                } header: {
+                    Text("Modo Pro")
+                } footer: {
+                    Text("Falsa cor: rosa = pele clara bem exposta, verde = cinza médio/pele escura, vermelho = estourado, azul/roxo = escuro demais.")
+                }
+                Section {
+                    if let name = camera.lutName {
+                        Text("LUT atual: \(name)")
+                        Button("Remover LUT", role: .destructive) { camera.removeLUT() }
+                    }
+                    Button(camera.lutName == nil ? "Importar LUT (.cube)" : "Trocar LUT (.cube)") { importLUT = true }
+                } header: {
+                    Text("Looks de cinema")
+                } footer: {
+                    Text("Use LUTs feitos para Rec.709. Ele vira o look \u{201C}Meu LUT\u{201D}.")
                 }
                 Section("Galeria") {
                     Toggle("Salvar a localização", isOn: $camera.useLocation)
                 }
                 Section {
-                    Text("TopCam 1.1 · uso pessoal\nDica: botões de volume e Controle da Câmera também tiram foto.")
+                    Text("TopCam 1.2 · uso pessoal\nDica: botões de volume e Controle da Câmera também tiram foto.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
             }
             .navigationTitle("Ajustes")
             .navigationBarTitleDisplayMode(.inline)
+            .fileImporter(isPresented: $importLUT,
+                          allowedContentTypes: [UTType(filenameExtension: "cube") ?? .data, .data]) { result in
+                if case .success(let url) = result { camera.importLUT(url) }
+            }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("OK") { dismiss() }
@@ -907,5 +1154,48 @@ struct PermissionView: View {
         .padding(32)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black)
+    }
+}
+
+// MARK: - Guias de enquadramento (4:5, 9:16...) e área segura
+
+struct FrameGuideOverlay: View {
+    let ratio: CGFloat?
+    let safeArea: Bool
+
+    var body: some View {
+        GeometryReader { geo in
+            let full = CGRect(origin: .zero, size: geo.size)
+            let inner = Self.fit(ratio, in: full)
+            ZStack {
+                if ratio != nil {
+                    Path { p in
+                        p.addRect(full)
+                        p.addRect(inner)
+                    }
+                    .fill(Color.black.opacity(0.55), style: FillStyle(eoFill: true))
+                    Rectangle()
+                        .stroke(Color.white.opacity(0.6), lineWidth: 1)
+                        .frame(width: inner.width, height: inner.height)
+                        .position(x: inner.midX, y: inner.midY)
+                }
+                if safeArea {
+                    Rectangle()
+                        .stroke(Color.topAccent.opacity(0.85), style: StrokeStyle(lineWidth: 1, dash: [6, 4]))
+                        .frame(width: inner.width * 0.80, height: inner.height * 0.66)
+                        .position(x: inner.minX + inner.width * 0.44, y: inner.minY + inner.height * 0.45)
+                }
+            }
+        }
+    }
+
+    static func fit(_ ratio: CGFloat?, in r: CGRect) -> CGRect {
+        guard let a = ratio, r.height > 0 else { return r }
+        if r.width / r.height > a {
+            let w = r.height * a
+            return CGRect(x: r.midX - w / 2, y: r.minY, width: w, height: r.height)
+        }
+        let h = r.width / a
+        return CGRect(x: r.minX, y: r.midY - h / 2, width: r.width, height: h)
     }
 }

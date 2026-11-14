@@ -11,7 +11,7 @@ enum CaptureMode: String, CaseIterable, Identifiable {
 }
 
 enum ProParam: String, CaseIterable, Identifiable {
-    case iso = "ISO", shutter = "VELOC.", wb = "BRANCO", focus = "FOCO", ev = "EV"
+    case iso = "ISO", shutter = "VELOC.", wb = "BRANCO", tint = "TINT", focus = "FOCO", ev = "EV"
     var id: String { rawValue }
 }
 
@@ -96,6 +96,27 @@ final class CameraModel: NSObject, ObservableObject {
     @Published var showZebra = false
     @Published var showPeaking = false
     @Published var histogram: [Float] = []
+    @Published var tint: Float = 0
+    @Published var focusA: Float?
+    @Published var focusB: Float?
+
+    // MARK: v1.2: desfoque de fundo, enquadramento e ferramentas do Blackmagic
+    @Published var blurOn = false { didSet { Prefs.set(blurOn, "blurOn"); updateRenderSettings() } }
+    @Published var blurAperture: Double = 2.8 { didSet { Prefs.set(blurAperture, "blurAperture"); updateRenderSettings() } }
+    @Published var frameAspect: FrameAspect = .off { didSet { Prefs.set(frameAspect.rawValue, "aspect") } }
+    @Published var cropOnSave = true { didSet { Prefs.set(cropOnSave, "cropOnSave") } }
+    @Published var showSafeArea = false { didSet { Prefs.set(showSafeArea, "safeArea") } }
+    @Published var showFalseColor = false { didSet { updateOverlays() } }
+    @Published var zebraLevel: Double = 95 { didSet { Prefs.set(zebraLevel, "zebraLevel"); updateOverlays() } }
+    @Published var peakColor: PeakColor = .green { didSet { Prefs.set(peakColor.rawValue, "peakColor"); updateOverlays() } }
+    @Published var lockWBOnRecord = true { didSet { Prefs.set(lockWBOnRecord, "lockWB") } }
+    @Published var cinemaShutter = false {
+        didSet {
+            Prefs.set(cinemaShutter, "cinemaShutter")
+            if !cinemaShutter, mode == .video, !isManual { restoreAutoExposure() }
+        }
+    }
+    @Published var lutName: String?
 
     /// Posição do celular no momento da foto/vídeo (90 = em pé, 0/180 = deitado).
     var captureAngle: CGFloat = 90
@@ -125,7 +146,19 @@ final class CameraModel: NSObject, ObservableObject {
     private var overlayZebra = false
     private var overlayPeaking = false
     private var overlayHistogram = false
+    private var overlayFalseColor = false
+    private var overlayZebraLevel: Float = 0.95
+    private var overlayPeakColor = CIColor(red: 0.22, green: 1, blue: 0.42)
+    private var renderBlur = false
+    private var renderAperture: Double = 2.8
     private var lastHistogram = Date.distantPast
+
+    // Máscara do assunto no visor (atualizada algumas vezes por segundo, fora da fila da câmera).
+    private var liveMask: CIImage?
+    private var maskBusy = false
+    private var lastMaskTime = Date.distantPast
+    private let maskQueue = DispatchQueue(label: "topcam.mask", qos: .userInitiated)
+    private var wbLockedForRecording = false
 
     // Última foto, para a tela de revisão (trocar o look depois).
     private var lastPhotoData: Data?
@@ -150,6 +183,17 @@ final class CameraModel: NSObject, ObservableObject {
         frameRate = Prefs.int("fps", 30)
         useLocation = Prefs.bool("location", true)
         keepHDR = Prefs.bool("hdr", true)
+        blurOn = Prefs.bool("blurOn", false)
+        blurAperture = Prefs.double("blurAperture", 2.8)
+        if let a = Prefs.string("aspect"), let saved = FrameAspect(rawValue: a) { frameAspect = saved }
+        cropOnSave = Prefs.bool("cropOnSave", true)
+        showSafeArea = Prefs.bool("safeArea", false)
+        zebraLevel = Prefs.double("zebraLevel", 95)
+        if let c = Prefs.string("peakColor"), let saved = PeakColor(rawValue: c) { peakColor = saved }
+        lockWBOnRecord = Prefs.bool("lockWB", true)
+        cinemaShutter = Prefs.bool("cinemaShutter", false)
+        lutName = LUTStore.shared.name
+        if look == .lut && !LUTStore.shared.hasLUT { look = .natural }
         updateRenderSettings()
 
         sceneDetector.onResult = { [weak self] suggested, label in
@@ -441,8 +485,12 @@ final class CameraModel: NSObject, ObservableObject {
     func setMode(_ newMode: CaptureMode) {
         guard !isRecording, newMode != mode else { return }
         if torchOn { setTorch(false) }
+        let wasVideo = mode == .video
         mode = newMode
         if newMode != .pro && isManual { resetToAuto() }
+        if wasVideo && cinemaShutter && !isManual { restoreAutoExposure() }
+        updateRenderSettings()
+        updateOverlays()
         reconfigure()
     }
 
@@ -531,6 +579,8 @@ final class CameraModel: NSObject, ObservableObject {
         let megapixels = photoMegapixels
         let keepHDR = self.keepHDR
         let loc = useLocation ? location.lastLocation : nil
+        let blur: BlurOptions? = blurOn ? BlurOptions(aperture: blurAperture) : nil
+        let aspect: CGFloat? = cropOnSave ? frameAspect.ratio : nil
 
         sessionQueue.async {
             if let connection = self.photoOutput.connection(with: .video), connection.isVideoRotationAngleSupported(angle) {
@@ -560,6 +610,7 @@ final class CameraModel: NSObject, ObservableObject {
 
             let id = settings.uniqueID
             let processor = PhotoCaptureProcessor(look: look, intensity: intensity, keepHDR: keepHDR,
+                                                  blur: blur, aspect: aspect,
                                                   location: loc, context: self.ciContext) { [weak self] result in
                 DispatchQueue.main.async {
                     if let thumb = result.thumbnail { self?.lastThumbnail = thumb }
@@ -587,25 +638,42 @@ final class CameraModel: NSObject, ObservableObject {
 
     // MARK: - Revisão: trocar o look da última foto
 
-    func reviewPreview(look: Look, intensity: Double, maxSide: CGFloat = 1400) -> UIImage? {
+    static let reviewSide: CGFloat = 1400
+
+    private func reviewBase() -> CIImage? {
         guard let data = lastPhotoData,
               let image = CIImage(data: data, options: [.applyOrientationProperty: true]) else { return nil }
-        let scale = min(1, maxSide / max(image.extent.width, image.extent.height))
-        let small = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-        let result = LookEngine.render(small, look: look, intensity: Float(intensity))
+        let scale = min(1, Self.reviewSide / max(image.extent.width, image.extent.height))
+        return image
+            .transformed(by: CGAffineTransform(translationX: -image.extent.minX, y: -image.extent.minY))
+            .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+    }
+
+    /// Separa pessoas/assunto da última foto (para escolher quem fica nítido).
+    func reviewMasks() -> SubjectMasks? {
+        guard let base = reviewBase() else { return nil }
+        return BackgroundBlur.segment(base, maxSide: Self.reviewSide, context: ciContext)
+    }
+
+    func reviewPreview(look: Look, intensity: Double, blur: BlurOptions? = nil, mask: CIImage? = nil) -> UIImage? {
+        guard var image = reviewBase() else { return nil }
+        if let blur, let mask { image = BackgroundBlur.apply(to: image, mask: mask, options: blur) }
+        let result = LookEngine.render(image, look: look, intensity: Float(intensity))
         guard let cg = ciContext.createCGImage(result, from: result.extent) else { return nil }
         return UIImage(cgImage: cg)
     }
 
-    func saveReviewVersion(look: Look, intensity: Double) {
+    func saveReviewVersion(look: Look, intensity: Double, blur: BlurOptions? = nil, mask: CIImage? = nil) {
         guard let data = lastPhotoData else { return }
         let meta = lastPhotoMetadata
         let loc = lastPhotoLocation
         let keepHDR = self.keepHDR
         let context = ciContext
+        let aspect: CGFloat? = cropOnSave ? frameAspect.ratio : nil
         DispatchQueue.global(qos: .userInitiated).async {
             let encoded = PhotoCaptureProcessor.encode(data: data, metadata: meta, look: look,
-                                                       intensity: Float(intensity), keepHDR: keepHDR, context: context)
+                                                       intensity: Float(intensity), keepHDR: keepHDR, context: context,
+                                                       blur: blur, mask: mask, aspect: aspect, skipSegmentation: blur != nil && mask == nil)
             PhotoSaver.savePhoto(main: encoded.data, raw: nil, location: loc) { ok in
                 DispatchQueue.main.async {
                     if let t = encoded.thumbnail { self.lastThumbnail = t }
@@ -634,6 +702,7 @@ final class CameraModel: NSObject, ObservableObject {
         let audioSettings = audioOutput.recommendedAudioSettingsForAssetWriter(writingTo: .mov) as? [String: Any]
         let rotation = (captureAngle - 90) * .pi / 180
         let fps = frameRate
+        if lockWBOnRecord && !isManual { setWhiteBalanceLock(true) }
         dataQueue.async {
             self.recorder.start(audioSettings: audioSettings,
                                 transform: CGAffineTransform(rotationAngle: rotation),
@@ -662,6 +731,7 @@ final class CameraModel: NSObject, ObservableObject {
         recordTimer?.invalidate()
         recordTimer = nil
         dataQueue.async { self.recorder.stop() }
+        if wbLockedForRecording { setWhiteBalanceLock(false) }
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
     }
 
@@ -734,11 +804,13 @@ final class CameraModel: NSObject, ObservableObject {
         case .iso: iso = Float(value)
         case .shutter: shutterSeconds = value
         case .wb: whiteBalance = Float(value)
+        case .tint: tint = Float(value)
         case .focus: focus = Float(value)
         case .ev: break
         }
         let param = proParam
         let iso = self.iso, shutter = self.shutterSeconds, wb = self.whiteBalance
+        let tint = self.tint
         let focus = self.focus
         sessionQueue.async {
             guard let device = self.videoInput?.device else { return }
@@ -755,16 +827,8 @@ final class CameraModel: NSObject, ObservableObject {
                         let duration = CMTime(seconds: seconds, preferredTimescale: 1_000_000)
                         device.setExposureModeCustom(duration: duration, iso: clampedISO, completionHandler: nil)
                     }
-                case .wb:
-                    if device.isWhiteBalanceModeSupported(.locked) {
-                        let tt = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(temperature: wb, tint: 0)
-                        var gains = device.deviceWhiteBalanceGains(for: tt)
-                        let maxGain = device.maxWhiteBalanceGain
-                        gains.redGain = min(max(gains.redGain, 1), maxGain)
-                        gains.greenGain = min(max(gains.greenGain, 1), maxGain)
-                        gains.blueGain = min(max(gains.blueGain, 1), maxGain)
-                        device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
-                    }
+                case .wb, .tint:
+                    Self.lockWhiteBalance(device, temperature: wb, tint: tint)
                 case .focus:
                     if device.isLockingFocusWithCustomLensPositionSupported {
                         device.setFocusModeLocked(lensPosition: focus, completionHandler: nil)
@@ -777,8 +841,132 @@ final class CameraModel: NSObject, ObservableObject {
         }
     }
 
+    /// Branco em Kelvin + tint (verde/magenta), igual ao Blackmagic. Chamar com o aparelho travado.
+    private static func lockWhiteBalance(_ device: AVCaptureDevice, temperature: Float, tint: Float) {
+        guard device.isWhiteBalanceModeSupported(.locked) else { return }
+        let tt = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(temperature: temperature, tint: tint)
+        var gains = device.deviceWhiteBalanceGains(for: tt)
+        let maxGain = device.maxWhiteBalanceGain
+        gains.redGain = min(max(gains.redGain, 1), maxGain)
+        gains.greenGain = min(max(gains.greenGain, 1), maxGain)
+        gains.blueGain = min(max(gains.blueGain, 1), maxGain)
+        device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
+    }
+
+    /// Presets de branco: Sol, Nublado, Sombra, Incandescente, Fluorescente.
+    func setWhiteBalancePreset(_ kelvin: Float) {
+        proParam = .wb
+        tint = 0
+        setManualValue(Double(kelvin))
+    }
+
+    /// Trava o branco durante a gravação (a cor não muda no meio do vídeo).
+    private func setWhiteBalanceLock(_ lock: Bool) {
+        wbLockedForRecording = lock
+        sessionQueue.async {
+            guard let device = self.videoInput?.device else { return }
+            do {
+                try device.lockForConfiguration()
+                if lock, device.isWhiteBalanceModeSupported(.locked) {
+                    device.whiteBalanceMode = .locked
+                } else if !lock, device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                    device.whiteBalanceMode = .continuousAutoWhiteBalance
+                }
+                device.unlockForConfiguration()
+            } catch {}
+        }
+    }
+
+    // MARK: - Rack focus (passa o foco suavemente de um ponto salvo para outro)
+
+    func saveFocusPoint(_ slot: Int) {
+        let value = videoInput?.device.lensPosition ?? focus
+        if slot == 0 { focusA = value } else { focusB = value }
+        showToast("Foco \(slot == 0 ? "A" : "B") salvo")
+        UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+    }
+
+    func rackFocus(to target: Float, seconds: Double = 1.2) {
+        isManual = true
+        let start = videoInput?.device.lensPosition ?? focus
+        let steps = 36
+        for i in 1...steps {
+            DispatchQueue.main.asyncAfter(deadline: .now() + seconds * Double(i) / Double(steps)) {
+                let t = Float(i) / Float(steps)
+                let eased = t * t * (3 - 2 * t)
+                let value = start + (target - start) * eased
+                self.focus = value
+                self.sessionQueue.async {
+                    guard let device = self.videoInput?.device, device.isLockingFocusWithCustomLensPositionSupported else { return }
+                    do {
+                        try device.lockForConfiguration()
+                        device.setFocusModeLocked(lensPosition: value, completionHandler: nil)
+                        device.unlockForConfiguration()
+                    } catch {}
+                }
+            }
+        }
+    }
+
+    // MARK: - Obturador de cinema (180°) sem piscar na luz de LED (60 Hz)
+
+    private func adjustCinemaExposure() {
+        let fps = Double(frameRate)
+        sessionQueue.async {
+            guard let device = self.videoInput?.device, device.isExposureModeSupported(.custom) else { return }
+            let target = fps > 30 ? 1.0 / 120.0 : 1.0 / 60.0
+            let format = device.activeFormat
+            var iso = device.iso
+            if device.exposureMode == .custom {
+                let offset = device.exposureTargetOffset
+                guard abs(offset) > 0.12 else { return }
+                iso *= powf(2, -offset * 0.6)
+            } else {
+                iso *= Float(CMTimeGetSeconds(device.exposureDuration) / target)
+            }
+            iso = min(max(iso, format.minISO), format.maxISO)
+            do {
+                try device.lockForConfiguration()
+                device.setExposureModeCustom(duration: CMTime(seconds: target, preferredTimescale: 1_000_000),
+                                             iso: iso, completionHandler: nil)
+                device.unlockForConfiguration()
+            } catch {}
+        }
+    }
+
+    private func restoreAutoExposure() {
+        sessionQueue.async {
+            guard let device = self.videoInput?.device else { return }
+            do {
+                try device.lockForConfiguration()
+                if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
+                device.unlockForConfiguration()
+            } catch {}
+        }
+    }
+
+    // MARK: - LUT
+
+    func importLUT(_ url: URL) {
+        if LUTStore.shared.importCube(from: url) {
+            lutName = LUTStore.shared.name
+            autoScene = false
+            look = .lut
+            showToast("LUT importado: \(lutName ?? "")")
+        } else {
+            showToast("Arquivo .cube inválido")
+        }
+    }
+
+    func removeLUT() {
+        LUTStore.shared.remove()
+        lutName = nil
+        if look == .lut { look = .natural }
+    }
+
     func resetToAuto() {
         isManual = false
+        tint = 0
         aeafLocked = false
         exposureBias = 0
         sessionQueue.async {
@@ -818,6 +1006,7 @@ final class CameraModel: NSObject, ObservableObject {
                 self.focus = device.lensPosition
             }
             if !device.isRampingVideoZoom { self.zoomFactor = device.videoZoomFactor }
+            if self.mode == .video, self.cinemaShutter, !self.isManual { self.adjustCinemaExposure() }
         }
     }
 
@@ -828,6 +1017,9 @@ final class CameraModel: NSObject, ObservableObject {
         overlayZebra = mode == .pro && showZebra
         overlayPeaking = mode == .pro && showPeaking
         overlayHistogram = mode == .pro && showHistogram
+        overlayFalseColor = mode == .pro && showFalseColor
+        overlayZebraLevel = Float(zebraLevel / 100)
+        overlayPeakColor = peakColor.ciColor
         settingsLock.unlock()
     }
 
@@ -835,6 +1027,9 @@ final class CameraModel: NSObject, ObservableObject {
         settingsLock.lock()
         renderLook = look
         renderIntensity = Float(intensity)
+        renderBlur = blurOn && mode != .video
+        renderAperture = blurAperture
+        if !renderBlur { liveMask = nil }
         settingsLock.unlock()
     }
 
@@ -868,6 +1063,8 @@ extension CameraModel: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAu
             let look = renderLook
             let intensity = renderIntensity
             let zebra = overlayZebra, peaking = overlayPeaking, wantHistogram = overlayHistogram
+            let falseColor = overlayFalseColor, zebraLevel = overlayZebraLevel, peakColor = overlayPeakColor
+            let blurOn = renderBlur, aperture = renderAperture, mask = liveMask
             settingsLock.unlock()
 
             let source = CIImage(cvPixelBuffer: pixelBuffer)
@@ -875,9 +1072,15 @@ extension CameraModel: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAu
             // Visor leve: aplica o look já no tamanho da tela (menos calor e bateria).
             let previewScale = min(1, 960 / max(source.extent.width, source.extent.height))
             let small = source.transformed(by: CGAffineTransform(scaleX: previewScale, y: previewScale))
-            var preview = LookEngine.render(small, look: look, intensity: intensity)
-            if peaking { preview = ProOverlays.focusPeaking(preview) }
-            if zebra { preview = ProOverlays.zebra(preview) }
+            var base = small
+            if blurOn {
+                if let mask { base = BackgroundBlur.apply(to: small, mask: mask, options: BlurOptions(aperture: aperture)) }
+                updateLiveMask(from: small)
+            }
+            var preview = LookEngine.render(base, look: look, intensity: intensity)
+            if falseColor { preview = ProOverlays.falseColor(preview) }
+            if peaking { preview = ProOverlays.focusPeaking(preview, color: peakColor) }
+            if zebra { preview = ProOverlays.zebra(preview, level: zebraLevel) }
             renderer.display(preview)
 
             // Gravação em resolução cheia, só quando está gravando.
@@ -899,6 +1102,29 @@ extension CameraModel: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAu
             recorder.appendAudio(sampleBuffer)
         }
     }
+
+    /// Recalcula a máscara do assunto no visor ~4 vezes por segundo, sem travar a câmera.
+    private func updateLiveMask(from image: CIImage) {
+        settingsLock.lock()
+        if maskBusy || Date().timeIntervalSince(lastMaskTime) < 0.25 { settingsLock.unlock(); return }
+        maskBusy = true
+        lastMaskTime = Date()
+        settingsLock.unlock()
+
+        let scale = 512 / max(image.extent.width, image.extent.height)
+        let tiny = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        guard let cg = ciContext.createCGImage(tiny, from: tiny.extent) else {
+            settingsLock.lock(); maskBusy = false; settingsLock.unlock()
+            return
+        }
+        maskQueue.async {
+            let mask = BackgroundBlur.segment(cgImage: cg, perInstance: false)?.all
+            self.settingsLock.lock()
+            if self.renderBlur { self.liveMask = mask }
+            self.maskBusy = false
+            self.settingsLock.unlock()
+        }
+    }
 }
 
 // MARK: - Processamento da foto
@@ -914,6 +1140,8 @@ final class PhotoCaptureProcessor: NSObject, AVCapturePhotoCaptureDelegate {
     private let look: Look
     private let intensity: Float
     private let keepHDR: Bool
+    private let blur: BlurOptions?
+    private let aspect: CGFloat?
     private let location: CLLocation?
     private let context: CIContext
     private let completion: (PhotoResult) -> Void
@@ -921,11 +1149,14 @@ final class PhotoCaptureProcessor: NSObject, AVCapturePhotoCaptureDelegate {
     private var metadata: [String: Any] = [:]
     private var rawData: Data?
 
-    init(look: Look, intensity: Float, keepHDR: Bool, location: CLLocation?, context: CIContext,
+    init(look: Look, intensity: Float, keepHDR: Bool, blur: BlurOptions?, aspect: CGFloat?,
+         location: CLLocation?, context: CIContext,
          completion: @escaping (PhotoResult) -> Void) {
         self.look = look
         self.intensity = intensity
         self.keepHDR = keepHDR
+        self.blur = blur
+        self.aspect = aspect
         self.location = location
         self.context = context
         self.completion = completion
@@ -950,12 +1181,13 @@ final class PhotoCaptureProcessor: NSObject, AVCapturePhotoCaptureDelegate {
         let meta = metadata
         let raw = rawData
         let look = self.look, intensity = self.intensity, keepHDR = self.keepHDR
+        let blur = self.blur, aspect = self.aspect
         let context = self.context, loc = self.location, completion = self.completion
         DispatchQueue.global(qos: .userInitiated).async {
             var encoded: (data: Data?, thumbnail: UIImage?) = (nil, nil)
             if let processed {
                 encoded = Self.encode(data: processed, metadata: meta, look: look, intensity: intensity,
-                                      keepHDR: keepHDR, context: context)
+                                      keepHDR: keepHDR, context: context, blur: blur, aspect: aspect)
             }
             let hasRaw = raw != nil
             PhotoSaver.savePhoto(main: encoded.data, raw: raw, location: loc) { ok in
@@ -967,7 +1199,9 @@ final class PhotoCaptureProcessor: NSObject, AVCapturePhotoCaptureDelegate {
 
     /// Aplica o look, mantém os dados da foto (EXIF) e o brilho HDR da Apple quando possível.
     static func encode(data: Data, metadata: [String: Any], look: Look, intensity: Float,
-                       keepHDR: Bool, context: CIContext) -> (data: Data?, thumbnail: UIImage?) {
+                       keepHDR: Bool, context: CIContext,
+                       blur: BlurOptions? = nil, mask: CIImage? = nil, aspect: CGFloat? = nil,
+                       skipSegmentation: Bool = false) -> (data: Data?, thumbnail: UIImage?) {
         guard let image = CIImage(data: data, options: [.applyOrientationProperty: true]) else { return (nil, nil) }
 
         // Dados da câmera sem a orientação (a imagem já está na posição certa).
@@ -978,13 +1212,26 @@ final class PhotoCaptureProcessor: NSObject, AVCapturePhotoCaptureDelegate {
             props[kCGImagePropertyTIFFDictionary as String] = tiff
         }
 
-        let result = LookEngine.render(image, look: look, intensity: intensity).settingProperties(props)
+        // Desfoque de fundo: acha a pessoa/assunto e desfoca o resto.
+        var subject = mask
+        if blur != nil, subject == nil, !skipSegmentation {
+            subject = BackgroundBlur.segment(image, maxSide: 1536, context: context)?.all
+        }
+        func finish(_ input: CIImage) -> CIImage {
+            var out = input
+            if let blur, let subject { out = BackgroundBlur.apply(to: out, mask: subject, options: blur) }
+            out = LookEngine.render(out, look: look, intensity: intensity)
+            if let aspect { out = FrameAspect.crop(out, ratio: aspect) }
+            return out
+        }
+
+        let result = finish(image).settingProperties(props)
         let colorSpace = CGColorSpace(name: CGColorSpace.displayP3) ?? CGColorSpaceCreateDeviceRGB()
         var options: [CIImageRepresentationOption: Any] = [:]
 
         if keepHDR, #available(iOS 18.0, *),
            let hdr = CIImage(data: data, options: [.applyOrientationProperty: true, .expandToHDR: true]) {
-            options[.hdrImage] = LookEngine.render(hdr, look: look, intensity: intensity)
+            options[.hdrImage] = finish(hdr)
         }
 
         let out = context.heifRepresentation(of: result, format: .RGBA8, colorSpace: colorSpace, options: options)
